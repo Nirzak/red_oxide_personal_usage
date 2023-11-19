@@ -14,7 +14,9 @@ use redacted::util::create_description;
 use regex::Regex;
 use strum::IntoEnumIterator;
 use tags::util::valid_tags;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use ReleaseType::{Flac24, Mp3320, Mp3V0};
 
 use crate::config::config::apply_config;
 use transcode::transcode::transcode_release;
@@ -22,7 +24,9 @@ use transcode::transcode::transcode_release;
 use crate::fs::util::get_all_files_with_extension;
 use crate::redacted::api::client::RedactedApi;
 use crate::redacted::api::constants::TRACKER_URL;
+use crate::redacted::api::constants::FORBIDDEN_CHARACTERS;
 use crate::redacted::api::path::is_path_exceeding_redacted_path_limit;
+use crate::redacted::models::ReleaseType::Flac;
 use crate::redacted::models::{Category, Media, ReleaseType};
 use crate::redacted::upload::TorrentUploadData;
 use crate::redacted::util::perma_link;
@@ -65,9 +69,9 @@ pub struct TranscodeCommand {
     #[arg(long, short, default_value = "false")]
     pub automatic_upload: bool,
 
-    /// If multiple formats should be transcoded in parallel (this will increase memory & cpu usage a lot, make sure you can handle it)
-    #[arg(long, default_value = "false")]
-    pub transcode_in_parallel: bool,
+    /// How many tasks (for transcoding as example) should be run in parallel, defaults to your CPU count
+    #[arg(long)]
+    pub concurrency: Option<usize>,
 
     /// The Api key from Redacted to use there API with
     #[arg(long)]
@@ -96,6 +100,10 @@ pub struct TranscodeCommand {
     /// List of allowed formats to transcode to, defaults to all formats if omitted
     #[arg(long, short = 'f')]
     pub allowed_transcode_formats: Vec<ReleaseType>,
+
+    /// If the existing formats check should be bypassed, useful when you want to transcode a torrent again or trump an already existing one, be aware that this will still take allowed_transcode_formats into account
+    #[arg(long, default_value = "false")]
+    pub skip_existing_formats_check: bool,
 
     /// If the transcode should be moved to the content directory, useful when you want to start seeding right after you upload
     #[arg(long, short, default_value = "false")]
@@ -147,14 +155,21 @@ async fn transcode(mut cmd: TranscodeCommand) -> anyhow::Result<()> {
     ))?;
 
     for url in cmd.urls.clone() {
-        handle_url(
+        let result = handle_url(
             url.as_str(),
             &term,
             &mut api,
             cmd.clone(),
             index_response.passkey.clone(),
         )
-        .await?;
+        .await;
+
+        if let Err(e) = result {
+            term.write_line(&format!(
+                "{} Skipping due to encountered error: {}",
+                ERROR, e
+            ))?;
+        }
     }
 
     Ok(())
@@ -174,7 +189,16 @@ async fn handle_url(
         .unwrap();
     }
 
-    let captures = RE.captures(url).unwrap();
+    let captures = match RE.captures(url) {
+        None => {
+            term.write_line(&format!(
+                "{} Could not parse permalink {}, please make sure you are using a valid permalink including group id and torrent id",
+                ERROR, url
+            ))?;
+            return Ok(());
+        }
+        Some(c) => c,
+    };
 
     let group_id = captures.get(2).unwrap().as_str().parse::<i64>().unwrap();
     let torrent_id = captures.get(3).unwrap().as_str().parse::<i64>().unwrap();
@@ -216,10 +240,10 @@ async fn handle_url(
             match t.format.as_str() {
                 "FLAC" => match t.encoding.as_str() {
                     "Lossless" => {
-                        existing_formats.insert(ReleaseType::Flac);
+                        existing_formats.insert(Flac);
                     }
                     "24bit Lossless" => {
-                        existing_formats.insert(ReleaseType::Flac24);
+                        existing_formats.insert(Flac24);
                     },
                     _ => {
                         term.write_line(&format!(
@@ -231,10 +255,10 @@ async fn handle_url(
                 "MP3" => {
                     match t.encoding.as_str() {
                         "320" => {
-                            existing_formats.insert(ReleaseType::Mp3320);
+                            existing_formats.insert(Mp3320);
                         }
                         "V0 (VBR)" => {
-                            existing_formats.insert(ReleaseType::Mp3V0);
+                            existing_formats.insert(Mp3V0);
                         }
                         _ => {
                             term.write_line(&format!(
@@ -253,9 +277,7 @@ async fn handle_url(
             }
         });
 
-    if !existing_formats.contains(&ReleaseType::Flac)
-        && !existing_formats.contains(&ReleaseType::Flac24)
-    {
+    if !existing_formats.contains(&Flac) && !existing_formats.contains(&Flac24) {
         term.write_line(&format!(
             "{} Torrent {} in group {} has no FLAC base to transcode from... skipping",
             WARNING, torrent_id, group_id
@@ -266,11 +288,23 @@ async fn handle_url(
     let mut transcode_formats = Vec::new();
 
     ReleaseType::iter().for_each(|release_type| {
-        if !existing_formats.contains(&release_type)
-            && release_type != ReleaseType::Flac24
-            && cmd.allowed_transcode_formats.contains(&release_type)
-        {
-            transcode_formats.push(release_type);
+        let format_already_exist = existing_formats.contains(&release_type);
+        let release_is_not_flac_24 = release_type != Flac24;
+        let release_is_allowed_to_transcode = cmd.allowed_transcode_formats.contains(&release_type);
+
+        let release_is_not_flac_24_and_allowed_to_transcode =
+            release_is_not_flac_24 && release_is_allowed_to_transcode;
+
+        if cmd.skip_existing_formats_check {
+            if release_is_not_flac_24_and_allowed_to_transcode
+                && (release_type != Flac || torrent.format != "FLAC")
+            {
+                transcode_formats.push(release_type);
+            }
+        } else {
+            if !format_already_exist && release_is_not_flac_24_and_allowed_to_transcode {
+                transcode_formats.push(release_type);
+            }
         }
     });
 
@@ -308,7 +342,7 @@ async fn handle_url(
 
     let group_name = group.name.replace(":", "");
 
-    let base_name = if torrent.remaster_title.len() > 1 {
+    let raw_base_name = if torrent.remaster_title.len() > 1 {
         format!(
             "{} - {} ({}) [{}]",
             artist, group_name, torrent.remaster_title, year
@@ -316,6 +350,7 @@ async fn handle_url(
     } else {
         format!("{} - {} [{}]", artist, group_name, year)
     };
+    let base_name = raw_base_name.replace(&FORBIDDEN_CHARACTERS[..], "_");
 
     let content_directory = cmd.content_directory.unwrap();
 
@@ -390,22 +425,65 @@ async fn handle_url(
 
         tokio::fs::create_dir_all(&to_create).await?;
 
+        let semaphore = Arc::new(Semaphore::new(cmd.concurrency.unwrap()));
+        let mut tasks = vec![];
+
         for flac in flacs {
-            spectrogram::spectrogram::make_spectrogram_zoom(
-                &flac_path,
-                &flac,
-                &spectrogram_directory,
-            )
-            .await?;
+            let semaphore = Arc::clone(&semaphore);
+            let spectrogram_directory = spectrogram_directory.clone();
+            let flac_path = flac_path.clone();
+            let flac = flac.clone();
+            let pb = pb.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut join_set = JoinSet::new();
 
-            spectrogram::spectrogram::make_spectrogram_full(
-                &flac_path,
-                &flac,
-                &spectrogram_directory,
-            )
-            .await?;
+                let semaphore_clone = Arc::clone(&semaphore);
+                let spectrogram_directory_clone = spectrogram_directory.clone();
+                let flac_path_clone = flac_path.clone();
+                let flac_clone = flac.clone();
 
-            pb.inc(1);
+                join_set.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.unwrap();
+
+                    spectrogram::spectrogram::make_spectrogram_zoom(
+                        &flac_path_clone,
+                        &flac_clone,
+                        &spectrogram_directory_clone,
+                    )
+                    .await?;
+
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                let semaphore_clone = Arc::clone(&semaphore);
+                let spectrogram_directory_clone = spectrogram_directory.clone();
+                let flac_path_clone = flac_path.clone();
+                let flac_clone = flac.clone();
+                join_set.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.unwrap();
+
+                    spectrogram::spectrogram::make_spectrogram_full(
+                        &flac_path_clone,
+                        &flac_clone,
+                        &spectrogram_directory_clone,
+                    )
+                    .await?;
+
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                while let Some(result) = join_set.join_next().await {
+                    result??;
+                }
+
+                pb.inc(1);
+
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+
+        for task in tasks {
+            task.await??;
         }
 
         let mut prompt = Confirm::new();
@@ -452,6 +530,7 @@ async fn handle_url(
 
     pb_main.tick();
 
+    let semaphore = Arc::new(Semaphore::new(cmd.concurrency.unwrap()));
     let mut join_set = JoinSet::new();
 
     multi_progress.println("[➡️] Transcoding...").unwrap();
@@ -464,10 +543,10 @@ async fn handle_url(
         pb_format.set_style(sty.clone());
 
         let transcode_format_str = match format {
-            ReleaseType::Flac24 => "FLAC 24bit",
-            ReleaseType::Flac => "FLAC",
-            ReleaseType::Mp3320 => "MP3 - 320",
-            ReleaseType::Mp3V0 => "MP3 - V0",
+            Flac24 => "FLAC 24bit",
+            Flac => "FLAC",
+            Mp3320 => "MP3 - 320",
+            Mp3V0 => "MP3 - V0",
         };
 
         let transcode_release_name = format!(
@@ -483,6 +562,7 @@ async fn handle_url(
         let mut output_dir = transcode_directory.clone();
         let format = format.clone();
         let pb_main_clone = pb_main.clone();
+        let semaphore_clone = semaphore.clone();
         join_set.spawn(tokio::spawn(async move {
             let (folder_path, command) = transcode_release(
                 &flac_path_clone,
@@ -493,6 +573,7 @@ async fn handle_url(
                 torrent_id_clone,
                 pb_format,
                 pb_main_clone,
+                semaphore_clone,
             )
             .await?;
 
@@ -571,17 +652,17 @@ async fn handle_url(
         let description = create_description(perma_link.clone(), command.clone());
 
         let format_red = match format {
-            ReleaseType::Flac24 => "FLAC",
-            ReleaseType::Flac => "FLAC",
-            ReleaseType::Mp3320 => "MP3",
-            ReleaseType::Mp3V0 => "MP3",
+            Flac24 => "FLAC",
+            Flac => "FLAC",
+            Mp3320 => "MP3",
+            Mp3V0 => "MP3",
         };
 
         let bitrate = match format {
-            ReleaseType::Flac24 => "24bit Lossless".to_string(),
-            ReleaseType::Flac => "Lossless".to_string(),
-            ReleaseType::Mp3320 => "320".to_string(),
-            ReleaseType::Mp3V0 => "V0 (VBR)".to_string(),
+            Flac24 => "24bit Lossless".to_string(),
+            Flac => "Lossless".to_string(),
+            Mp3320 => "320".to_string(),
+            Mp3V0 => "V0 (VBR)".to_string(),
         };
 
         if cmd.move_transcode_to_content {
@@ -601,10 +682,10 @@ async fn handle_url(
 
             let scene = if torrent.scene { "Yes" } else { "No" };
             let format = match format {
-                ReleaseType::Flac24 => "FLAC",
-                ReleaseType::Flac => "FLAC",
-                ReleaseType::Mp3320 => "MP3",
-                ReleaseType::Mp3V0 => "MP3",
+                Flac24 => "FLAC",
+                Flac => "FLAC",
+                Mp3320 => "MP3",
+                Mp3V0 => "MP3",
             };
 
             term.write_line(&*("Link: ".to_owned() + &*perma_link))?;
